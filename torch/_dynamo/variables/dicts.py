@@ -117,7 +117,8 @@ class ConstDictVariable(VariableTracker):
 
     def __init__(
         self,
-        items: dict[VariableTracker, VariableTracker],
+        items: dict[VariableTracker, VariableTracker]
+        | dict[HashableTracker, VariableTracker],
         **kwargs: Any,
     ) -> None:
         # .clone() pass these arguments in kwargs but they're recreated a few
@@ -159,7 +160,7 @@ class ConstDictVariable(VariableTracker):
         self.should_reconstruct_all = (
             not is_from_local_source(self.source) if self.source else True
         )
-        self.original_items = items.copy()
+        self.original_items = {key.vt: value for key, value in self.items.items()}
         # Re-entrancy guard for is_python_constant against self-referential
         # dicts. Both forms re-enter this same instance's is_python_constant, so
         # a per-instance flag suffices.
@@ -363,7 +364,11 @@ class ConstDictVariable(VariableTracker):
         codegen.append_output(create_instruction("BUILD_MAP", arg=num_args))
 
     def reconstruct(self, codegen: "PyCodegen") -> None:
-        if self._contains_self_reference():
+        # A dict built through the side effects new-object path is materialized
+        # and cached before its contents are codegen'd, so the self-referencing
+        # value already has an object to load. Emitting the placeholder below
+        # would shadow that cache entry with a plain dict.
+        if self._contains_self_reference() and self not in codegen.tempvars:
             codegen.extend_output(
                 [
                     create_instruction("BUILD_MAP", arg=0),
@@ -1006,7 +1011,11 @@ class OrderedDictVariable(ConstDictVariable):
                 ]
             )
         )
-        if self._contains_self_reference():
+        # An object built through the side effects new-object path is already
+        # materialized and cached, so the self-referencing item has something to
+        # load. Emitting the placeholder below would rebind that cache entry to
+        # the placeholder instead of the real object.
+        if self._contains_self_reference() and self not in codegen.tempvars:
             codegen.extend_output(
                 [
                     *create_call_function(0, False),

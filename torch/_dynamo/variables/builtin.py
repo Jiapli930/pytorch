@@ -88,6 +88,7 @@ from .base import (
     GetSet,
     Member,
     Method,
+    NO_SUCH_SUBOBJ,
     readonly_setter,
     unmodeled_setter,
     ValueMutationNew,
@@ -1915,6 +1916,18 @@ class BuiltinVariable(BaseBuiltinVariable):
             # object.__init__ is a no-op
             return variables.ConstantVariable.create(None)
 
+        if self.fn is object and name in ("__str__", "__repr__") and len(args) == 1:
+            # object.__str__ runs object_str, which returns tp_repr(obj). The
+            # type's own tp_str is never consulted, so this cannot be dispatched
+            # as a slot call on args[0].
+            return generic_repr(tx, args[0])
+
+        if self.fn is type and name == "__repr__" and len(args) == 1 and not kwargs:
+            # type.__repr__ runs type's own slot even when the metaclass
+            # overrides __repr__, so it must not be dispatched as a slot call on
+            # args[0].  Handled by BaseBuiltinVariable.call_method below.
+            return super().call_method(tx, name, args, kwargs)
+
         if (
             isinstance(self.fn, type)
             and args
@@ -1923,11 +1936,8 @@ class BuiltinVariable(BaseBuiltinVariable):
                 (types.WrapperDescriptorType, types.MethodDescriptorType),
             )
         ):
-            if (
-                isinstance(args[0], variables.UserDefinedObjectVariable)
-                and args[0]._base_vt is not None
-            ):
-                return args[0]._base_vt.call_method(tx, name, args[1:], kwargs)
+            if isinstance(args[0], variables.UserDefinedObjectVariable):
+                return args[0].call_base_method(tx, name, args[1:], kwargs)
             return args[0].call_method(tx, name, args[1:], kwargs)
 
         if (
@@ -1987,11 +1997,19 @@ class BuiltinVariable(BaseBuiltinVariable):
 
         if name == "__hash__" and len(args) == 1 and not kwargs:
             arg = args[0]
+            arg_type = maybe_get_python_type(arg)
             if (
-                isinstance(arg, variables.UserDefinedConstantVariable)
-                and arg._base_vt is not None
+                isinstance(self.fn, type)
+                and arg_type is not None
+                and issubclass(arg_type, self.fn)
             ):
-                return generic_hash(tx, arg._base_vt)
+                if arg_type is self.fn:
+                    return generic_hash(tx, arg)
+                # Explicit base-class unbound call, e.g. int.__hash__(self)
+                real_value = arg.get_real_python_backed_value()
+                if real_value is not NO_SUCH_SUBOBJ:
+                    # pyrefly: ignore[bad-argument-count]
+                    return ConstantVariable.create(self.fn.__hash__(real_value))
 
         return super().call_method(tx, name, args, kwargs)
 
@@ -3342,14 +3360,10 @@ class DictBuiltinVariable(BaseBuiltinVariable):
 
         resolved_fn = getattr(dict, name, None)
         if resolved_fn is not None and resolved_fn in dict_methods:
-            if isinstance(args[0], variables.UserDefinedDictVariable):
-                if args[0]._base_vt is None:
-                    raise AssertionError(
-                        "UserDefinedDictVariable._base_vt must not be None for dict method dispatch"
-                    )
-                return args[0]._base_vt.call_method(tx, name, args[1:], kwargs)
-            elif isinstance(args[0], ConstDictVariable):
-                return args[0].call_method(tx, name, args[1:], kwargs)
+            obj = args[0]
+            if isinstance(obj, UserDefinedObjectVariable):
+                return obj.call_base_method(tx, name, args[1:], kwargs)
+            return obj.call_method(tx, name, args[1:], kwargs)
 
         return super().call_method(tx, name, args, kwargs)
 
@@ -3969,8 +3983,8 @@ class ListBuiltinVariable(BaseBuiltinVariable):
         resolved_fn = getattr(list, name, None)
         if resolved_fn is not None and resolved_fn in list_methods:
             obj = args[0]
-            if isinstance(obj, UserDefinedObjectVariable) and obj._base_vt is not None:
-                return obj._base_vt.call_method(tx, name, args[1:], kwargs)
+            if isinstance(obj, UserDefinedObjectVariable):
+                return obj.call_base_method(tx, name, args[1:], kwargs)
             return obj.call_method(tx, name, args[1:], kwargs)
 
         return super().call_method(tx, name, args, kwargs)
