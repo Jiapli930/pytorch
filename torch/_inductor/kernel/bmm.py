@@ -136,11 +136,18 @@ def _bmm_shared_a_configs(dtype):
 
 
 @SymbolicGridFn
-def blackwell_bmm_grid(b, m, n, meta, *, cdiv, max, min):
-    # Keep the persistent M/N tile loop local to one logical batch.  grid_x
-    # supplies at most one SM-wide wave of workers for that matrix, while
-    # grid_y/grid_z enumerate independent batches.  The z split is needed only
-    # when the batch count would exceed CUDA's grid_y limit.
+def blackwell_bmm_grid(*args, cdiv, max, min):
+    # The BMM template supports both [B, M, N] and flattened [B * M, N]
+    # outputs.  Read the logical problem from its compile-time mapping instead
+    # of inferring it from the output layout passed before ``meta``.
+    # X supplies at most one SM-wide persistent M/N worker set per matrix;
+    # Y/Z enumerate independent batches, with Z used only when B exceeds the
+    # CUDA grid-Y limit. The rounded Y/Z product can exceed B, so the kernel
+    # must retain its batch guard.
+    meta = args[-1]
+    b = meta["BATCH_SIZE"]
+    m = meta["LOGICAL_M"]
+    n = meta["LOGICAL_N"]
     grid_m = cdiv(m, meta["BLOCK_M"])
     if meta["TWO_CTAS"]:
         grid_m = cdiv(grid_m, 2) * 2
@@ -198,6 +205,7 @@ BLACKWELL_BMM_MAX_AUTOTUNE_CONFIGS = (
     BlackwellBMMConfig(128, 128, 128, 3, 8),
     BlackwellBMMConfig(128, 256, 64, 4, 8),
 )
+
 
 aten_bmm = ExternKernelChoice(torch.bmm, "at::bmm_out", op_overload=aten.bmm.out)
 aten_bmm_dtype = ExternKernelChoice(
